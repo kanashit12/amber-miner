@@ -1,0 +1,85 @@
+name: amber-grind
+
+# Amber (琥珀币) PoW shard grinding for wallet 1 (kanashit.ai).
+# Manual dispatch only. Each matrix job grinds a disjoint 2^40 nonce range:
+# shard i covers [i * 2^40, (i+1) * 2^40). Found nonces go to results.jsonl,
+# are printed into the job log, and are uploaded as artifact result-<shard>.
+# Merge the artifacts locally with collect.py into
+# ~/workspace/amber-check/batch_w1.jsonl for the 2026-11-05 20:00 WIB
+# auto-submit job. This workflow never sends any transaction.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "number of parallel shard jobs"
+        required: true
+        default: "20"
+      need_per_shard:
+        description: "stop each shard after this many finds"
+        required: true
+        default: "1"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          n = int("${{ inputs.shards }}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps(list(range(n))) + "\n")
+          print("shards:", n)
+          EOF
+
+  grind:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pycryptodome
+        run: pip install pycryptodome
+
+      - name: Selftest (known PREP.md solution)
+        run: python3 grind_shard.py --selftest
+
+      - name: Grind shard ${{ matrix.shard }}
+        run: |
+          START=$(( ${{ matrix.shard }} * 1099511627776 ))
+          echo "shard ${{ matrix.shard }} range: [$START, $((START + 1099511627776)))"
+          python3 grind_shard.py \
+            --start "$START" \
+            --count 1099511627776 \
+            --need "${{ inputs.need_per_shard }}" \
+            --shard "${{ matrix.shard }}" \
+            --out results.jsonl
+
+      - name: Show results in job log (survives artifact failure)
+        if: always()
+        run: |
+          echo "=== RESULTS shard ${{ matrix.shard }} ==="
+          cat results.jsonl 2>/dev/null || echo "(no results file)"
+          grep -h "^FOUND" "$GITHUB_WORKSPACE"/*.log 2>/dev/null || true
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.shard }}
+          path: results.jsonl
+          if-no-files-found: warn
+          retention-days: 7
